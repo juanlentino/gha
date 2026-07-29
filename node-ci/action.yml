@@ -1,0 +1,158 @@
+name: "Node CI"
+description: "Install once, then typecheck + lint + test in a single billed job."
+
+# ── Why this is a COMPOSITE action and not a reusable workflow ───────────────
+# GitHub bills per JOB, rounded up to the whole minute. Composite action steps
+# execute INSIDE the calling job, so the whole thing rounds once. A reusable
+# workflow (jobs.<id>.uses) creates a SEPARATE job that rounds separately —
+# using one here would defeat the entire purpose.
+#
+# Measured on a real repo before consolidation: three jobs, each paying its own
+# checkout + setup-node + npm ci. npm ci was 40-61s of every 60-87s job, run
+# three times, for 32s of combined actual work — ~5-6 billed minutes per push.
+# One job doing all three is ~102s → 2 billed minutes.
+#
+# The caller still does its own actions/checkout, because a composite action
+# cannot check out the calling repository for you.
+
+inputs:
+  node-version-file:
+    description: "File to read the Node version from. Falls back to node-version."
+    required: false
+    default: ".nvmrc"
+  node-version:
+    description: "Explicit Node version, used only when node-version-file is absent."
+    required: false
+    default: ""
+  install:
+    description: "Install command. Use 'npm ci' unless the repo has no lockfile."
+    required: false
+    default: "npm ci"
+  typecheck:
+    description: "Run `npm run typecheck` if the script exists."
+    required: false
+    default: "true"
+  lint:
+    description: "Run `npm run lint` if the script exists."
+    required: false
+    default: "true"
+  test:
+    description: "Run `npm test` if the script exists."
+    required: false
+    default: "true"
+  cache-node-modules:
+    description: >
+      Cache node_modules keyed on the lockfile hash. Turns a ~60s install into a
+      ~5s restore, BUT skips npm's install lifecycle, so any dependency with a
+      postinstall step (native builds, playwright, prisma generate) will be
+      silently missing on a cache hit. Off by default: a wrong build is worth
+      more than a minute. Audit for postinstall before enabling.
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve Node version source
+      id: node
+      shell: bash
+      run: |
+        set -euo pipefail
+        # setup-node errors if node-version-file points at a missing file, which
+        # would make this action unusable in a repo without .nvmrc.
+        if [ -n "${{ inputs.node-version-file }}" ] && [ -f "${{ inputs.node-version-file }}" ]; then
+          echo "file=${{ inputs.node-version-file }}" >> "$GITHUB_OUTPUT"
+          echo "version=" >> "$GITHUB_OUTPUT"
+        else
+          echo "file=" >> "$GITHUB_OUTPUT"
+          echo "version=${{ inputs.node-version }}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - uses: actions/setup-node@v5
+      with:
+        node-version-file: ${{ steps.node.outputs.file }}
+        node-version: ${{ steps.node.outputs.version }}
+        # Caches ~/.npm tarballs, NOT node_modules — that is by design and is
+        # why it does not make `npm ci` fast. Kept because it is free and helps
+        # a cold registry fetch; see cache-node-modules for the real lever.
+        cache: npm
+
+    - name: Restore node_modules
+      id: modcache
+      if: inputs.cache-node-modules == 'true'
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-nodemodules-${{ hashFiles('**/package-lock.json') }}
+
+    - name: Install
+      if: steps.modcache.outputs.cache-hit != 'true'
+      shell: bash
+      run: ${{ inputs.install }}
+
+    # Each check runs even if an earlier one failed, so one run tells you
+    # everything that is broken instead of only the first thing. The gate below
+    # is what actually fails the job.
+    - name: typecheck
+      id: typecheck
+      if: inputs.typecheck == 'true'
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        if npm run | grep -qE '^  typecheck$'; then
+          npm run typecheck
+        else
+          echo "no typecheck script — skipping"
+        fi
+
+    - name: lint
+      id: lint
+      if: inputs.lint == 'true'
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        if npm run | grep -qE '^  lint$'; then
+          npm run lint
+        else
+          echo "no lint script — skipping"
+        fi
+
+    - name: test
+      id: test
+      if: inputs.test == 'true'
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        if npm run | grep -qE '^  test$'; then
+          npm test
+        else
+          echo "no test script — skipping"
+        fi
+
+    # continue-on-error makes the steps above green regardless, so WITHOUT this
+    # gate the action would pass while the code is broken — the exact
+    # silent-success shape worth avoiding. Explicit `if` rather than
+    # `[ ... ] && fail=1`, because under `set -e` that form's exit status is
+    # version-dependent and would fail the gate on a fully passing run.
+    - name: Gate
+      shell: bash
+      run: |
+        set -euo pipefail
+        fail=0
+        for pair in "typecheck:${{ steps.typecheck.outcome }}" \
+                    "lint:${{ steps.lint.outcome }}" \
+                    "test:${{ steps.test.outcome }}"; do
+          name="${pair%%:*}"; outcome="${pair#*:}"
+          if [ "$outcome" = "failure" ]; then
+            echo "::error::$name failed"
+            fail=1
+          fi
+        done
+        if [ "$fail" -ne 0 ]; then
+          echo "one or more checks failed — see the annotated steps above"
+          exit 1
+        fi
+        echo "all checks passed"
