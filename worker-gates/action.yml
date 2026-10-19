@@ -1,0 +1,53 @@
+name: "Worker gates"
+description: "Dependency-provenance, dependency-cooldown and outbound-redirect gates, as steps inside the calling job."
+
+# ── Why a COMPOSITE action ───────────────────────────────────────────────────
+# Same reason as node-ci: Actions bills per JOB, rounded up to the whole minute.
+# These three gates take ~1-3s each, so they run as STEPS inside the caller's
+# existing test job and add no billed job. A reusable workflow would add one.
+#
+# The caller must already have checked out its repo, set up Node 24 (npm >= 11:
+# npm 10 silently omits the attestation `verified` array) and run `npm ci`.
+# Every gate reads the CALLER's files from the workspace: package.json,
+# package-lock.json, .attestation-allowlist.json, .cooldown-accept.json, src/.
+#
+# One canonical copy instead of five drifting ones: before this action the
+# attestation gate's #31 fix (drift judged per name@version) had reached only
+# one of the five workers.
+
+inputs:
+  min-files:
+    description: >
+      Outbound-redirect gate floor: the fewest src/ files the scan must reach.
+      Per repo on purpose (it measures that repo's src/ size, as a broken-scan
+      detector), so there is no default. Lower it deliberately, in the commit
+      that removes files.
+    required: true
+  min-calls:
+    description: >
+      Outbound-redirect gate floor: the fewest outbound calls the resolver must
+      see. Per repo, no default, same reasoning as min-files.
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # Leg 1 of R6c: registry signatures all valid, and the set of unattested
+    # name@version entries no larger than the reviewed allowlist.
+    - name: Dependency-provenance gate
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/attestation-gate.mjs"
+    # Leg 2 of R6c: no locked version younger than min_age_days, except
+    # reviewed accepts. Fail-closed on unmeasured ages; re-run on registry flake.
+    - name: Dependency cooldown gate
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/dependency-cooldown.mjs"
+    # Every outbound call in src/ sets redirect:"manual"/"error" or carries a
+    # `redirect-ok:` comment. Plain Node on purpose: some callers run vitest
+    # inside workerd, where vite's native parser binding cannot load.
+    - name: Outbound redirect gate
+      shell: bash
+      env:
+        MIN_FILES: ${{ inputs.min-files }}
+        MIN_CALLS: ${{ inputs.min-calls }}
+      run: node "$GITHUB_ACTION_PATH/outbound-redirect-gate.mjs"
