@@ -1,0 +1,19 @@
+name: Test
+
+# This repo is public, so these minutes are free; the timeout still guards a
+# hung run. Unit tests for the worker-gates scripts (node:test, no install).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: node --test worker-gates/test/

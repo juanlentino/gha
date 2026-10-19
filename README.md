@@ -70,6 +70,40 @@ jobs:
   always on and caches `~/.npm` tarballs, **not** `node_modules`, which is why
   it doesn't make `npm ci` fast.
 
+## `worker-gates`
+
+The three supply-chain and outbound gates the Cloudflare workers run, as steps
+inside the caller's existing test job (no extra billed job):
+
+- **Dependency-provenance gate** (`attestation-gate.mjs`): every package has a
+  valid registry signature, and the set of unattested `name@version` entries
+  stays within the reviewed `.attestation-allowlist.json` (keyed by name).
+- **Dependency cooldown gate** (`dependency-cooldown.mjs`): no locked version is
+  younger than `.cooldown-accept.json`'s `min_age_days`, except reviewed accepts.
+- **Outbound redirect gate** (`outbound-redirect-gate.mjs`): every outbound call
+  in `src/` sets `redirect: "manual"`/`"error"` or carries a `redirect-ok:` note.
+
+```yaml
+      - uses: actions/setup-node@<sha> # Node 24: the attestation gate needs npm >= 11
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: juanlentino/gha/worker-gates@<sha> # v1.x
+        with:
+          min-files: 9
+          min-calls: 3
+      - run: npm test
+```
+
+`min-files` and `min-calls` have no default on purpose. They are floors on the
+outbound scan (files reached, calls resolved) that tell a broken scan from a
+clean one, so each repo states its own, near its current `src/` size. Lower one
+deliberately, in the commit that removes the files or calls.
+
+The gates read the caller's files from the workspace, and the outbound gate
+loads `vite` (already present for vitest) from the caller's `node_modules`.
+
 ## Pinning
 
 `@v1` is a moving major tag. Pin a commit SHA if you want immutability.
